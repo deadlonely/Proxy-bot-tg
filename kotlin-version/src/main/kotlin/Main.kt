@@ -43,14 +43,51 @@ fun saveProxyStatus() {
     try { ensureStatusDir(); statusFile.writeText(mapper.writeValueAsString(proxyStatus)) } catch (e: Exception) { println("Failed saving proxy status: ${e.message}") }
 }
 
+// --- user stats persistence ---
+data class UserActions(val actions: MutableMap<String, Int> = mutableMapOf(), var last: String = Instant.now().toString())
+val userStats = mutableMapOf<Long, UserActions>()
+val userStatsFile = Paths.get("..", "db", "user_stats.json").toFile()
+
+fun loadUserStats() {
+    try {
+        if (!userStatsFile.exists()) return
+        val txt = userStatsFile.readText()
+        if (txt.isBlank()) return
+        val type = mapper.typeFactory.constructMapType(Map::class.java, Long::class.java, UserActions::class.java)
+        val m = mapper.readValue<Map<Long, UserActions>>(txt, type)
+        for ((k, v) in m) userStats[k] = v
+    } catch (e: Exception) { println("Failed loading user stats: ${e.message}") }
+}
+
+fun saveUserStats() {
+    try {
+        userStatsFile.parentFile.mkdirs()
+        userStatsFile.writeText(mapper.writeValueAsString(userStats))
+    } catch (e: Exception) { println("Failed saving user stats: ${e.message}") }
+}
+
+fun isAdmin(uid: Long): Boolean {
+    val raw = System.getenv("ADMIN_ID") ?: System.getenv("ADMIN") ?: ""
+    val admins = raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+    return admins.contains(uid.toString())
+}
+
+fun incUserStat(uid: Long, key: String) {
+    userStats.computeIfAbsent(uid) { UserActions() }.apply {
+        actions.compute(key) { _, v -> (v ?: 0) + 1 }
+        last = Instant.now().toString()
+    }
+}
+
 object AppInit {
     init {
         Thread {
             while (true) {
-                try { Thread.sleep(60_000); saveProxyStatus() } catch (_: Exception) { }
+                try { Thread.sleep(60_000); saveProxyStatus(); saveUserStats() } catch (_: Exception) { }
             }
         }.apply { isDaemon = true; start() }
         loadProxyStatus()
+        loadUserStats()
     }
 }
 
@@ -318,7 +355,35 @@ fun runBot() {
 
                     if (text.startsWith("/start")) {
                         val kb = buildInlineKeyboard(listOf(listOf(mapOf("text" to "RU", "callback_data" to "lang_ru"), mapOf("text" to "EN", "callback_data" to "lang_en"))))
+                        try { incUserStat(fromId, "start") } catch (_: Exception) {}
                         sendMessage(chatId, "*Выберите язык / Choose language*", kb)
+                    }
+                    
+                    if (text.startsWith("/mystats")) {
+                        val s = userStats[fromId] ?: UserActions()
+                        val total = s.actions.values.fold(0) { a, b -> a + b }
+                        var msg = "Your stats:\nTotal actions: $total\n"
+                        for (k in s.actions.keys.sorted()) {
+                            msg += "${k}: ${s.actions[k]}\n"
+                        }
+                        msg += "Last: ${s.last}\n"
+                        sendMessage(chatId, msg)
+                    }
+                    
+                    if (text.startsWith("/stats")) {
+                        if (!isAdmin(fromId)) {
+                            sendMessage(chatId, "Not authorized")
+                            continue
+                        }
+                        val rows = userStats.map { (uid, s) ->
+                            val total = s.actions.values.fold(0) { a, b -> a + b }
+                            Triple(uid, total, s.last)
+                        }.sortedByDescending { it.second }
+                        var msg = "Users: ${rows.size}\nTop users:\n"
+                        for (r in rows.take(20)) {
+                            msg += "${r.first}: ${r.second} (last ${r.third})\n"
+                        }
+                        sendMessage(chatId, msg)
                     }
                 }
 
@@ -336,6 +401,7 @@ fun runBot() {
                         data.startsWith("lang_") -> {
                             val lang = data.substringAfter("lang_")
                             userLang[fromId] = lang
+                            try { incUserStat(fromId, "lang_${lang}") } catch (_: Exception) {}
                             answerCallback(callbackId, if (lang=="ru") "Язык выбран: Русский" else "Language set: English")
                             val provider = System.getenv("PROVIDER_NAME") ?: "Nexora"
                             val text = if (lang=="ru") "🌋 $provider - Proxy\n\n📄 Описание\nПремиум-прокси с глобальным покрытием\n🚀 Быстрый · Надёжный · Анонимный\n\n☰ Главное меню" else "🌋 $provider - Proxy\n\n📄 Description\nPremium proxy service with global coverage\n🚀 Fast · Reliable · Anonymous\n\n☰ Main Menu"
@@ -347,6 +413,7 @@ fun runBot() {
                             try { editOrReplyForUser(fromId, chatId, messageId, text, kb) } catch (e: Exception) { try { editMessage(chatId, messageId, text, kb) } catch (_: Exception) { sendMessage(chatId, text, kb) } }
                         }
                         data == "open_proxies" -> {
+                            try { incUserStat(fromId, "open_proxies") } catch (_: Exception) {}
                             val lang = userLang[fromId] ?: "ru"
                             val regionsMap = parseProxiesGroupedByIp(proxiesFile)
                             val regions = regionsMap.keys.toList()
@@ -417,6 +484,7 @@ fun runBot() {
                             try { editOrReplyForUser(fromId, chatId, messageId, text, kb) } catch (_: Exception) { try { sendMessage(chatId, text, kb) } catch (_: Exception){} }
                         }
                         data.startsWith("region_") -> {
+                            try { incUserStat(fromId, "open_region_${region}") } catch (_: Exception) {}
                             val lang = userLang[fromId] ?: "ru"
                             val region = data.substringAfter("region_")
                             val regionsMap = parseProxiesGroupedByIp(proxiesFile)
@@ -438,6 +506,7 @@ fun runBot() {
                             val region = parts[1]; val idx = parts[2].toIntOrNull() ?: 0
                             val regionsMap = parseProxiesGroupedByIp(proxiesFile)
                             val entries = regionsMap[region] ?: emptyList()
+                            try { incUserStat(fromId, "check_${region}_${idx}") } catch (_: Exception) {}
                             if (idx >= entries.size) { answerCallback(callbackId, if ((userLang[fromId] ?: "ru")=="ru") "Прокси не найдено" else "Proxy not found") ; continue }
                             answerCallback(callbackId, if ((userLang[fromId] ?: "ru")=="ru") "Проверяю..." else "Checking...")
                             val (alive, ms) = measureProxyLatency(entries[idx].proxy, 5000)
@@ -462,6 +531,7 @@ fun runBot() {
                             val region = parts[1]; val idx = parts[2].toIntOrNull() ?: 0
                             val regionsMap = parseProxiesGroupedByIp(proxiesFile)
                             val entries = regionsMap[region] ?: emptyList()
+                            try { incUserStat(fromId, "qr_${region}_${idx}") } catch (_: Exception) {}
                             if (idx >= entries.size) { answerCallback(callbackId, if ((userLang[fromId]?:"ru")=="ru") "Прокси не найдено" else "Proxy not found") ; continue }
                             val qr = generateSocksQR(entries[idx].proxy)
                             if (qr == null) { answerCallback(callbackId, if ((userLang[fromId]?:"ru")=="ru") "Ошибка генерации QR" else "QR generation error"); continue }
@@ -476,6 +546,7 @@ fun runBot() {
                             val region = parts[1]; val idx = parts[2].toIntOrNull() ?: 0
                             val regionsMap = parseProxiesGroupedByIp(proxiesFile)
                             val entries = regionsMap[region] ?: emptyList()
+                            try { incUserStat(fromId, "connect_${region}_${idx}") } catch (_: Exception) {}
                             if (idx >= entries.size) { answerCallback(callbackId, if ((userLang[fromId]?:"ru")=="ru") "Прокси не найдено" else "Proxy not found") ; continue }
                             val entry = entries[idx]
                             val link = generateSocksQR(entry.proxy)?.first ?: ""
