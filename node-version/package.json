@@ -1,0 +1,19 @@
+{
+  "name": "proxy-bot",
+  "version": "1.0.0",
+  "description": "Telegram бот для выдачи прокси с QR-кодами",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "qrcode": "^1.5.3",
+    "socks-proxy-agent": "^8.0.2",
+    "telegraf": "^4.15.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
