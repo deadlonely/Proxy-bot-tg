@@ -51,6 +51,47 @@ process.once('exit', () => saveProxyStatus());
 process.once('SIGINT', () => { saveProxyStatus(); process.exit(); });
 process.once('SIGTERM', () => { saveProxyStatus(); process.exit(); });
 
+// --- user stats persistence ---
+const USER_STATS_FILE = path.join(__dirname, 'db', 'user_stats.json');
+const userStats = {};
+
+function loadUserStats() {
+  try {
+    if (!fs.existsSync(USER_STATS_FILE)) return;
+    const raw = fs.readFileSync(USER_STATS_FILE, 'utf8');
+    const j = JSON.parse(raw || '{}');
+    for (const k of Object.keys(j)) userStats[k] = j[k];
+  } catch (e) { console.error('Failed loading user stats:', e.message); }
+}
+
+function saveUserStats() {
+  try {
+    try { fs.mkdirSync(path.dirname(USER_STATS_FILE), { recursive: true }); } catch (e) { }
+    const tmp = USER_STATS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(userStats, null, 2), 'utf8');
+    fs.renameSync(tmp, USER_STATS_FILE);
+  } catch (e) { console.error('Failed saving user stats:', e.message); }
+}
+
+loadUserStats();
+setInterval(() => { saveUserStats(); }, 60 * 1000);
+process.once('exit', () => saveUserStats());
+process.once('SIGINT', () => { saveUserStats(); process.exit(); });
+process.once('SIGTERM', () => { saveUserStats(); process.exit(); });
+
+function isAdmin(uid) {
+  const raw = (process.env.ADMIN_ID || process.env.ADMIN || '');
+  const admins = raw.split(',').map(s => String(s).trim()).filter(Boolean);
+  return admins.includes(String(uid));
+}
+
+function incUserStat(uid, key) {
+  if (!uid) return;
+  userStats[uid] = userStats[uid] || { actions: {}, last: new Date().toISOString() };
+  userStats[uid].last = new Date().toISOString();
+  userStats[uid].actions[key] = (userStats[uid].actions[key] || 0) + 1;
+}
+
 async function detectCountryCodeForHost(host) {
   if (!host) return 'AUTO';
   if (ipCountryCache[host]) return ipCountryCache[host];
@@ -287,6 +328,7 @@ bot.action('open_proxies', async (ctx) => {
   const regions = Object.keys(regionsMap);
   const total = Object.values(regionsMap).reduce((s, a) => s + a.length, 0);
   const uid = ctx.from.id;
+  try { incUserStat(uid, 'open_proxies'); } catch (e) { }
   if (!regions.length) return ctx.reply(tr(uid, 'Нет доступных прокси. Поместите список в proxies.txt', 'No proxies available. Put list in proxies.txt'));
   const kb = regions.map(r => {
     const flag = countryCodeToFlag(r);
@@ -326,6 +368,7 @@ bot.action(/region_(.+)/, async (ctx) => {
   const uid = ctx.from.id;
   await ctx.answerCbQuery(tr(uid, '⏳ Проверка...', '⏳ Checking...'));
   const region = ctx.match[1];
+  try { incUserStat(uid, `open_region_${region}`); } catch (e) { }
   const regionsMap = await parseProxiesGroupedByIp();
   const entries = regionsMap[region] || [];
   if (!entries.length) return ctx.reply(tr(uid, 'Нет прокси в этом регионе', 'No proxies in this region'));
@@ -354,6 +397,7 @@ bot.action(/check_(.+)_(\d+)/, async (ctx) => {
   await ctx.answerCbQuery(tr(uid, 'Проверяю...', 'Checking...'));
   const region = ctx.match[1];
   const idx = parseInt(ctx.match[2], 10);
+  try { incUserStat(uid, `check_${region}_${idx}`); } catch (e) { }
   const regionsMap = await parseProxiesGroupedByIp();
   const entries = regionsMap[region] || [];
   if (idx >= entries.length) return ctx.answerCbQuery(tr(uid, 'Прокси не найдено', 'Proxy not found'), { show_alert: true });
@@ -427,6 +471,7 @@ bot.action(/qr_(.+)_(\d+)/, async (ctx) => {
   const regionsMap = await parseProxiesGroupedByIp();
   const entries = regionsMap[region] || [];
   const uid = ctx.from.id;
+  try { incUserStat(uid, `qr_${region}_${idx}`); } catch (e) { }
   if (idx >= entries.length) return ctx.reply(tr(uid, 'Прокси не найдено', 'Proxy not found'));
   const { type, proxy } = entries[idx];
   const qr = await generateSocksQR(proxy);
@@ -463,6 +508,7 @@ bot.action(/connect_(.+)_(\d+)/, async (ctx) => {
   const [host, port] = addr.split(':');
   const link = `tg://socks?server=${encodeURIComponent(host)}&port=${port}` + (user ? `&user=${encodeURIComponent(user)}&pass=${encodeURIComponent(pass)}` : '');
   const uid = ctx.from.id;
+  try { incUserStat(uid, `connect_${region}_${idx}`); } catch (e) { }
   const lang = (userState[uid] && userState[uid].lang) || 'ru';
   const textRu = `📡 *Подключение к прокси*\n\n🌐 Регион: ${region} ${countryCodeToFlag(region)}\n🖥️ Сервер: <code>${host}</code>\n🔌 Порт: <code>${port}</code>\n👤 Пользователь: ${user || '—'}\n\nНажмите кнопку ниже, чтобы подключиться:`;
   const textEn = `📡 *Proxy connection*\n\n🌐 Region: ${region} ${countryCodeToFlag(region)}\n🖥️ Server: <code>${host}</code>\n🔌 Port: <code>${port}</code>\n👤 User: ${user || '—'}\n\nPress the button below to connect:`;
@@ -475,6 +521,34 @@ bot.action(/connect_(.+)_(\d+)/, async (ctx) => {
 });
 
 console.log('About to launch bot...');
+// --- stats commands ---
+bot.command('mystats', async (ctx) => {
+  const uid = ctx.from.id;
+  const s = userStats[uid] || { actions: {} };
+  const actions = s.actions || {};
+  const total = Object.values(actions).reduce((a,b) => a + (Number(b)||0), 0);
+  let text = `Your stats:\nTotal actions: ${total}\n`;
+  for (const k of Object.keys(actions).sort()) {
+    text += `${k}: ${actions[k]}\n`;
+  }
+  if (s.last) text += `Last: ${s.last}\n`;
+  return ctx.reply(text);
+});
+
+bot.command('stats', async (ctx) => {
+  const uid = ctx.from.id;
+  if (!isAdmin(uid)) return ctx.reply('Not authorized');
+  // compute totals per user
+  const rows = Object.keys(userStats).map(u => {
+    const actions = userStats[u].actions || {};
+    const total = Object.values(actions).reduce((a,b) => a + (Number(b)||0), 0);
+    return { uid: u, total, last: userStats[u].last || '' };
+  }).sort((a,b) => b.total - a.total);
+  let text = `Users: ${rows.length}\nTop users:\n`;
+  const top = rows.slice(0, 20);
+  for (const r of top) text += `${r.uid}: ${r.total} (last ${r.last})\n`;
+  return ctx.reply(text);
+});
 bot.launch().then(() => console.log('Proxy bot started')).catch((e) => { console.error('launch error', e && e.stack ? e.stack : e); process.exit(1); });
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
